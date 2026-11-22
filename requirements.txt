@@ -1,0 +1,3 @@
+# Versions observed in the local runtime; offline scoring needs no packages.
+openai==3.52.0
+matplotlib==3.10.8

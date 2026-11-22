@@ -1,0 +1,13 @@
+{
+  "xml_sha256": "54843a906fe81b16b376ec56c27d737455eeff4e8a6e01506d7b958f77b36dfc",
+  "records": 12421,
+  "seed": 42,
+  "strata": {
+    "complex_address": 106,
+    "missing_fields": 95,
+    "ordinary": 104,
+    "special_year": 95
+  },
+  "development": 100,
+  "holdout": 300
+}

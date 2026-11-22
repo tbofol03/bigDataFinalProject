@@ -1,126 +1,113 @@
-# LLM-Assisted Cleaning of Bilingual Hong Kong Building Records
+# Bilingual Building Data Cleaning
 
-規則式基線 + 選擇性 DeepSeek 清洗管線  
-（對應 COMP6132 專案提案）
+Rule-based cleaning with selective DeepSeek assistance for complex bilingual
+building addresses. The pipeline preserves source records, rule outputs, model
+proposals and final values. Changes must pass source-evidence validation before
+they are accepted. Failed requests and rejected proposals retain the rule values.
 
-## 功能概述
+## Repository layout
 
-本腳本實作提案中的混合式清洗流程：
-
-1. **流式 XML 解析**：不將整個檔案載入記憶體，適合處理約 12,421 筆記錄。
-2. **規則式正規化**：
-   - 多欄位名稱與地址拼接
-   - 常見街道縮寫展開（Rd. → Road、Blk → Block 等）
-   - 年份分類（numeric / blank / dash / pre_1945 / other）
-   - 置信度計算與問題標記
-3. **選擇性 LLM 路由**：僅對低置信度或有問題的記錄呼叫 DeepSeek，控制 token 成本。
-4. **評估指標輸出**：對應提案第 IV 節所列指標。
-5. **圖表產生**：自動輸出摘要圖表（PNG）。
-
-## 環境需求
-
-```bash
-pip install openai matplotlib
-# 選用（簡繁轉換）
-pip install opencc-python-reimplemented
-# 或
-pip install zhconv
+```text
+*.py           Cleaning, sampling, evaluation and result assembly
+tests/         Request limits, concurrency, cache and rate-limit checks
+data/          Archived XML snapshot
+inputs/        Frozen workload manifests and source-based reference labels
+runs/          Original measured outputs and recovery outputs
+results/       Scores, component audits and the three-scale summary
+supporting/    Enhanced-rule and duplicate-pair comparisons
 ```
 
-## 使用方式
+Python 3.11 or newer is required. Offline cleaning and scoring use the standard
+library. `requirements.txt` records the locally used versions of the API SDK and
+optional plotting library. API calls require `DEEPSEEK_API_KEY` in the environment.
 
-### 1. 純規則式（不消耗 token）
+## Completed results
+
+All three workloads have completed, with zero remaining request errors.
+Each scale is scored against the same 300 XML-grounded reference records.
+
+| Records | Model-routed records | Applied proposals | Nonempty address exact agreement |
+|---:|---:|---:|---:|
+| 500 | 149 | 37 | 505/506 (99.80%) |
+| 5,000 | 1,654 | 370 | 505/506 (99.80%) |
+| 12,421 | 4,217 | 897 | 500/506 (98.81%) |
+
+The original rule baseline matches 466/506 nonempty address fields (92.09%).
+Agreement here measures source-based formatting, including spaces and commas.
+The difficulty-enriched reference sample does not estimate population accuracy.
+The component audit checks preservation of explicit source components; it is not
+an external address-registry check. Details and timing/cost limitations are in
+[results/README.md](results/README.md).
+
+The enhanced floor-separator rule baseline reaches 504/506 nonempty fields.
+The v2 guard was inspected after holdout use and is a diagnostic. The experiment
+does not establish that the LLM outperforms enhanced rules. Duplicate-pair data
+contains no confirmed positives, so duplicate recall and F1 are not established.
+
+## Reproduce results without API calls
+
+Run from the repository root:
 
 ```bash
-python importData.py \
-  --url https://www.rvd.gov.hk/datagovhk/bnb-u.xml \
-  -o cleaned_rule.csv \
-  --limit 1000
+python -m unittest discover -s tests -v
+python finalize_results.py
 ```
 
-### 2. 選擇性 LLM 模式（僅低置信度記錄消耗 token）
+The second command verifies XML and workload hashes, checks source-record
+alignment and request/recovery accounting, recomputes the three-scale scores,
+and produces `experiment_results.zip`. It does not call the model API.
+
+Reproduce just the full-workload field score:
 
 ```bash
-export DEEPSEEK_API_KEY="sk-your-api-key-here"
-
-python importData.py \
-  --url https://www.rvd.gov.hk/datagovhk/bnb-u.xml \
-  -o cleaned_hybrid.csv \
-  --use-llm \
-  --limit 200
+python experiment.py score --labels inputs/labels_holdout_reviewed.csv --baseline runs/rules-full.jsonl --hybrid runs/resumed-c8-rpm60-full.jsonl --out scores-rerun.json
 ```
 
-### 3. 使用本地檔案 + 簡繁轉換
+Reproduce the address-component audit:
 
 ```bash
-# 先下載
-curl -L -o bnb-u.xml https://www.rvd.gov.hk/datagovhk/bnb-u.xml
-
-# 香港繁體轉簡體
-python importData.py \
-  --file bnb-u.xml \
-  -o cleaned.csv \
-  --convert hk2s \
-  --use-llm
+python address_review.py score --indices inputs/indices_holdout.json --baseline runs/rules-full.jsonl --hybrid runs/resumed-c8-rpm60-full.jsonl --labels results/address-review-full.csv --protocol source-fidelity --out components-rerun.json
 ```
 
-## 主要參數
+Reproduce the duplicate-pair score:
 
-| 參數 | 說明 | 預設值 |
-|------|------|--------|
-| `--url` | XML 檔案網址 | - |
-| `--file` | 本地 XML 檔案路徑 | - |
-| `-o` / `--output` | 輸出檔案路徑（必填） | - |
-| `--format` | 輸出格式（csv / jsonl） | csv |
-| `--limit` | 最多處理筆數（0 = 全部） | 0 |
-| `--convert` | 簡繁轉換（none / t2s / hk2s / s2t） | none |
-| `--use-llm` | 啟用選擇性 DeepSeek 呼叫 | 關閉 |
-| `--model` | DeepSeek 模型名稱 | deepseek-chat |
-| `--archived-count` | 原始檔案預期總筆數 | 12421 |
+```bash
+python duplicate_review.py score --xml data/bnb-u.xml --labels supporting/duplicate_pairs_reviewed.csv --out duplicate-rerun.json
+```
 
-## 輸出說明
+An empty expected field is a verified empty value; `__SKIP__` excludes a field
+from scoring. Source-based labels are identified as such. Independently collected
+labels should record their own review protocol and adjudication status.
 
-### CSV / JSONL 欄位
+## Run new experiments
 
-- 清洗後的中英文名稱與地址
-- 年份分類與數值
-- 置信度分數與 `needs_llm` 標記
-- `input_tokens` / `output_tokens`（僅 LLM 模式有值）
-- `llm_applied`、`llm_rationale`、`unresolved`（LLM 模式）
+Create new manifests in a separate directory when intentionally changing the
+sample. Keep the supplied frozen manifests for comparisons with measured runs.
 
-### 圖表
+```bash
+python experiment.py sample --xml data/bnb-u.xml --out new-inputs --seed 42
+python importData.py --file data/bnb-u.xml --format jsonl -o new-rules.jsonl --metrics-json new-rules.json --no-plot
+```
 
-執行完成後會產生 `{output_stem}_summary.png`，包含：
+Install the optional live dependencies and set the API key in your own terminal.
+The example below starts a new workload and incurs API usage:
 
-- 年份分類分布
-- 主要缺失率
-- 置信度分數分布
-- 路由與 LLM 應用比例
+```bash
+python -m pip install -r requirements.txt
+python importData.py --file data/bnb-u.xml --indices inputs/indices_500.json --format jsonl -o new-hybrid.jsonl --metrics-json new-hybrid.json --use-llm --model deepseek-flash --cache-dir runs/new-cache-500 --max-llm-requests 149 --concurrency 8 --requests-per-minute 60 --no-plot
+```
 
-### 終端機評估報告
+Concurrent requests preserve the original API arguments and default thinking
+settings. Rate-limit responses trigger a shared cooldown. Successful responses
+are cached; failed calls remain visible and are not silently retried. Use
+`--replay-only` with an existing matching cache for offline response replay.
+Caches are not included in this repository package.
 
-對應提案第 IV 節指標，包括：
+`formal_run.py` verifies frozen inputs and orchestrates matched workloads; its
+help lists the required paths and explicit request/pricing limits. Live timing
+requires a fresh cache. Recovery timing includes cached work and must be reported
+separately. The original 32-worker run and its paced recovery are both retained.
 
-- Parsing completeness
-- Name / Address bilingual consistency
-- Year anomalies
-- Records per minute
-- Routed record ratio
-- Total input / output tokens
-- Runtime
-
-## 注意事項
-
-- 未加 `--use-llm` 時完全不消耗 token。
-- 建議先以 `--limit 200` 測試 LLM 模式，確認 API Key 與成本。
-- 原始資料來源：[Rating and Valuation Department – Names of Buildings](https://www.rvd.gov.hk/datagovhk/bnb-u.xml)
-- 本管線保留原始欄位與清洗結果，支援後續品質比較與溯源。
-
-## 專案對應
-
-本實作對應提案目標：
-
-- (i) 建立可重現的規則式清洗基線
-- (ii) 僅對低置信度記錄加入 LLM 輔助
-- (iii) 提供三個資料規模的評估框架
-- (iv) 輸出錯誤、耗時、token 用量與成本相關資訊
+The dataset source is the [Hong Kong Rating and Valuation Department XML feed](https://www.rvd.gov.hk/datagovhk/bnb-u.xml).
+The archived snapshot hash is recorded in `inputs/metadata.json`. Keep original
+measured outputs intact when changing code or comparing future experiments.
