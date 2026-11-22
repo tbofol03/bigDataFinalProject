@@ -1,0 +1,65 @@
+{
+  "records": 300,
+  "hybrid_statuses": {
+    "not_requested": 220,
+    "applied": 21,
+    "unchanged": 58,
+    "unsupported_change": 1
+  },
+  "fields": {
+    "english_name": {
+      "n": 300,
+      "baseline_correct": 300,
+      "hybrid_correct": 300,
+      "correct_repairs": 0,
+      "regressions": 0,
+      "changes": 0,
+      "baseline_accuracy": 1.0,
+      "hybrid_accuracy": 1.0,
+      "delta_percentage_points": 0.0
+    },
+    "chinese_name": {
+      "n": 300,
+      "baseline_correct": 300,
+      "hybrid_correct": 300,
+      "correct_repairs": 0,
+      "regressions": 0,
+      "changes": 0,
+      "baseline_accuracy": 1.0,
+      "hybrid_accuracy": 1.0,
+      "delta_percentage_points": 0.0
+    },
+    "english_address": {
+      "n": 300,
+      "baseline_correct": 280,
+      "hybrid_correct": 299,
+      "correct_repairs": 19,
+      "regressions": 0,
+      "changes": 20,
+      "baseline_accuracy": 0.9333333333333333,
+      "hybrid_accuracy": 0.9966666666666667,
+      "delta_percentage_points": 6.333333333333333
+    },
+    "chinese_address": {
+      "n": 300,
+      "baseline_correct": 280,
+      "hybrid_correct": 295,
+      "correct_repairs": 16,
+      "regressions": 1,
+      "changes": 21,
+      "baseline_accuracy": 0.9333333333333333,
+      "hybrid_accuracy": 0.9833333333333333,
+      "delta_percentage_points": 5.0
+    }
+  },
+  "year_anomalies": {
+    "n": 300,
+    "correct": 300,
+    "tp": 111,
+    "fp": 0,
+    "fn": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0
+  }
+}

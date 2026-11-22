@@ -1,0 +1,87 @@
+{
+  "method": "blinded paired XML source-fidelity audit",
+  "components": {
+    "english_address": {
+      "door_number": {
+        "scored_pairs": 251,
+        "rules_correct": 251,
+        "hybrid_correct": 251,
+        "repairs": 0,
+        "regressions": 0,
+        "skipped_pairs": 49,
+        "rules_accuracy": 1.0,
+        "hybrid_accuracy": 1.0,
+        "delta_percentage_points": 0.0
+      },
+      "street": {
+        "scored_pairs": 250,
+        "rules_correct": 250,
+        "hybrid_correct": 250,
+        "repairs": 0,
+        "regressions": 0,
+        "skipped_pairs": 50,
+        "rules_accuracy": 1.0,
+        "hybrid_accuracy": 1.0,
+        "delta_percentage_points": 0.0
+      },
+      "block_or_phase": {
+        "skipped_pairs": 300,
+        "rules_accuracy": null,
+        "hybrid_accuracy": null,
+        "delta_percentage_points": null
+      },
+      "floor": {
+        "skipped_pairs": 277,
+        "scored_pairs": 23,
+        "rules_correct": 23,
+        "hybrid_correct": 23,
+        "repairs": 0,
+        "regressions": 0,
+        "rules_accuracy": 1.0,
+        "hybrid_accuracy": 1.0,
+        "delta_percentage_points": 0.0
+      }
+    },
+    "chinese_address": {
+      "door_number": {
+        "scored_pairs": 251,
+        "rules_correct": 251,
+        "hybrid_correct": 251,
+        "repairs": 0,
+        "regressions": 0,
+        "skipped_pairs": 49,
+        "rules_accuracy": 1.0,
+        "hybrid_accuracy": 1.0,
+        "delta_percentage_points": 0.0
+      },
+      "street": {
+        "scored_pairs": 249,
+        "rules_correct": 249,
+        "hybrid_correct": 249,
+        "repairs": 0,
+        "regressions": 0,
+        "skipped_pairs": 51,
+        "rules_accuracy": 1.0,
+        "hybrid_accuracy": 1.0,
+        "delta_percentage_points": 0.0
+      },
+      "block_or_phase": {
+        "skipped_pairs": 300,
+        "rules_accuracy": null,
+        "hybrid_accuracy": null,
+        "delta_percentage_points": null
+      },
+      "floor": {
+        "skipped_pairs": 277,
+        "scored_pairs": 23,
+        "rules_correct": 23,
+        "hybrid_correct": 23,
+        "repairs": 0,
+        "regressions": 0,
+        "rules_accuracy": 1.0,
+        "hybrid_accuracy": 1.0,
+        "delta_percentage_points": 0.0
+      }
+    }
+  }
+}
