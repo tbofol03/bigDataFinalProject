@@ -8,16 +8,24 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, asdict
+from collections import Counter
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 from urllib.request import urlopen
 from xml.etree.ElementTree import iterparse
+
+from floor_separators import FLOOR_RULE_REVISION, format_floor_sections
+from llm_cleaning import PROMPT_VERSION, decide_changes, get_model_result, is_semantic_candidate
+from request_pacing import PacedClient
 
 try:
     from openai import OpenAI
@@ -37,9 +45,10 @@ except ImportError:
 
 NULL_MARKERS = {"", "-", "N/A", "n/a", "NA", "None", "null", "NULL"}
 ABBREV_MAP = {
-    r"\brd\.?\b": "Road", r"\bst\.?\b": "Street", r"\bave\.?\b": "Avenue",
-    r"\bblvd\.?\b": "Boulevard", r"\bdr\.?\b": "Drive", r"\blane\b": "Lane",
-    r"\bblk\.?\b": "Block", r"\bbl\.?\b": "Block", r"\bg/f\b": "G/F",
+    r"(?<!\w)rd\b\.?": "Road", r"(?<!\w)st\b\.?": "Street",
+    r"(?<!\w)ave\b\.?": "Avenue", r"(?<!\w)blvd\b\.?": "Boulevard",
+    r"(?<!\w)dr\b\.?": "Drive", r"\blane\b": "Lane",
+    r"(?<!\w)blk\b\.?": "Block", r"(?<!\w)bl\b\.?": "Block", r"\bg/f\b": "G/F",
 }
 YEAR_PRE_1945_PATTERN = re.compile(r"pre\s*1945", re.IGNORECASE)
 YEAR_NUMERIC_PATTERN = re.compile(r"^\d{4}$")
@@ -103,6 +112,13 @@ class BuildingRecord:
     llm_rationale: str = ""
     llm_confidence: str = ""
     unresolved: bool = False
+    rule_values: Dict[str, str] = field(default_factory=dict)
+    llm_proposal: Dict[str, Any] = field(default_factory=dict)
+    llm_status: str = "not_requested"
+    llm_origin: str = "none"
+    llm_error: str = ""
+    llm_requested: bool = False
+    request_latency_seconds: Optional[float] = None
 
 def clean_text(value: Optional[str]) -> str:
     if value is None:
@@ -124,11 +140,11 @@ def concatenate_parts(parts: List[str], separator: str = " ") -> str:
     return separator.join(p for p in parts if p)
 
 def classify_year(raw: str) -> tuple[str, Optional[int]]:
+    if raw.strip() == "-":
+        return "dash", None
     text = clean_text(raw)
     if not text:
         return "blank", None
-    if text == "-":
-        return "dash", None
     if YEAR_PRE_1945_PATTERN.search(text):
         return "pre_1945", None
     if YEAR_NUMERIC_PATTERN.match(text):
@@ -188,7 +204,7 @@ def compute_confidence(rec: BuildingRecord) -> float:
         score -= 0.1
     return max(0.0, min(1.0, score))
 
-def clean_record(raw: Dict[str, str], index: int) -> BuildingRecord:
+def clean_record(raw: Dict[str, str], index: int, *, floor_separators: bool = False) -> BuildingRecord:
     rec = BuildingRecord(raw=raw.copy(), source_index=index)
     en_names = [clean_text(raw.get(f"EnglishBuildingName{i}")) for i in (1, 2, 3)]
     zh_names = [clean_text(raw.get(f"ChineseBuildingName{i}")) for i in (1, 2, 3)]
@@ -199,6 +215,9 @@ def clean_record(raw: Dict[str, str], index: int) -> BuildingRecord:
     rec.chinese_name = concatenate_parts(zh_names)
     rec.english_address = normalize_address(concatenate_parts(en_addrs, ", "))
     rec.chinese_address = concatenate_parts(zh_addrs)
+    if floor_separators:
+        rec.english_address = format_floor_sections(rec.english_address, "english")
+        rec.chinese_address = format_floor_sections(rec.chinese_address, "chinese")
     rec.chinese_name_simplified = convert_chinese(rec.chinese_name)
     rec.chinese_address_simplified = convert_chinese(rec.chinese_address)
     rec.year_build_raw = raw.get("YearBuild", "")
@@ -209,64 +228,99 @@ def clean_record(raw: Dict[str, str], index: int) -> BuildingRecord:
     rec.public_housing_type_zh_simplified = convert_chinese(rec.public_housing_type_zh)
     rec.issues = detect_issues(rec)
     rec.confidence = compute_confidence(rec)
-    rec.needs_llm = rec.confidence < 0.7 or bool(rec.issues)
+    rec.rule_values = {key: getattr(rec, key) for key in (
+        "english_name", "chinese_name", "english_address", "chinese_address",
+    )}
+    rec.needs_llm = is_semantic_candidate(rec.rule_values)
     return rec
 
-def call_deepseek(rec: BuildingRecord, client: OpenAI, model: str = "deepseek-chat") -> None:
-    prompt = f"""You are cleaning a bilingual Hong Kong building record.
-Raw fields:
-{json.dumps(rec.raw, ensure_ascii=False, indent=2)}
-
-Current rule-based result:
-English name: {rec.english_name}
-Chinese name: {rec.chinese_name}
-English address: {rec.english_address}
-Chinese address: {rec.chinese_address}
-Year category: {rec.year_category}
-Issues: {rec.issues}
-
-Return STRICT JSON only with these keys:
-{{
-  "english_name": "string or null",
-  "chinese_name": "string or null",
-  "english_address": "string or null",
-  "chinese_address": "string or null",
-  "rationale": "short explanation",
-  "confidence": "high|medium|low",
-  "unresolved": true/false
-}}
-
-Rules:
-- Do NOT invent a name or address if the raw record has no supporting evidence.
-- Prefer "unresolved": true when evidence is insufficient.
-"""
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            response_format={"type": "json_object"},
-        )
-        usage = response.usage
-        rec.input_tokens = usage.prompt_tokens if usage else 0
-        rec.output_tokens = usage.completion_tokens if usage else 0
-        content = response.choices[0].message.content
-        data = json.loads(content)
-        if data.get("english_name"):
-            rec.english_name = data["english_name"]
-        if data.get("chinese_name"):
-            rec.chinese_name = data["chinese_name"]
-        if data.get("english_address"):
-            rec.english_address = data["english_address"]
-        if data.get("chinese_address"):
-            rec.chinese_address = data["chinese_address"]
-        rec.llm_rationale = data.get("rationale", "")
-        rec.llm_confidence = data.get("confidence", "")
-        rec.unresolved = bool(data.get("unresolved", False))
-        rec.llm_applied = True
-    except Exception as e:
-        rec.llm_rationale = f"LLM error: {e}"
+def call_deepseek(rec: BuildingRecord, client, model: str = "deepseek-chat",
+                  cache_dir: Optional[Path] = None) -> None:
+    result = get_model_result(rec, client, model, cache_dir)
+    rec.llm_requested = result.requested
+    rec.request_latency_seconds = result.latency
+    rec.input_tokens = result.input_tokens
+    rec.output_tokens = result.output_tokens
+    rec.llm_error = result.error
+    rec.llm_origin = result.status
+    if result.status not in {"live", "cache_hit"}:
+        rec.llm_status = result.status
         rec.unresolved = True
+        return
+    try:
+        data = json.loads(result.content)
+    except (ValueError, TypeError):
+        rec.llm_status = "invalid_json"
+        rec.unresolved = True
+        return
+    if isinstance(data, dict):
+        rec.llm_proposal = data
+    status, changes = decide_changes(data, rec.raw, rec.rule_values, normalize_address)
+    rec.llm_status = status
+    rec.llm_applied = status == "applied"
+    rec.unresolved = status not in {"applied", "unchanged"}
+    if isinstance(data, dict):
+        rec.llm_rationale = str(data.get("rationale", ""))
+        rec.llm_confidence = str(data.get("confidence", ""))
+    for key, value in changes.items():
+        setattr(rec, key, value)
+    if "chinese_name" in changes:
+        rec.chinese_name_simplified = convert_chinese(rec.chinese_name)
+    if "chinese_address" in changes:
+        rec.chinese_address_simplified = convert_chinese(rec.chinese_address)
+
+
+def process_llm_records(records: Iterator[BuildingRecord], client, model: str,
+                        cache_dir: Optional[Path], *, concurrency: int = 1,
+                        max_requests: Optional[int] = None, replay_only: bool = False,
+                        route: str = "selective") -> List[BuildingRecord]:
+    """Bound in-flight work and reserve the live request budget before submission."""
+    if concurrency < 1 or (max_requests is not None and max_requests < 0):
+        raise ValueError("Invalid concurrency or request limit")
+    cleaned = []
+    live_calls = completed = 0
+    pending = {}
+
+    def mark_done(rec):
+        nonlocal live_calls, completed
+        live_calls += int(rec.llm_requested)
+        completed += 1
+        if completed % 10 == 0:
+            print(f"  evaluated {completed:,} candidates, {live_calls:,} live requests",
+                  file=sys.stderr, flush=True)
+
+    def reap():
+        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        for future in done:
+            rec = pending.pop(future)
+            future.result()
+            mark_done(rec)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        for rec in records:
+            cleaned.append(rec)
+            if not (rec.needs_llm or route == "all"):
+                continue
+            # Each unfinished job can consume one live request. Wait for its
+            # actual usage before reusing a reservation released by a cache hit.
+            while pending and (
+                len(pending) >= concurrency
+                or (max_requests is not None and live_calls + len(pending) >= max_requests)
+            ):
+                reap()
+            capped = max_requests is not None and live_calls >= max_requests
+            if capped:
+                call_deepseek(rec, None, model, cache_dir)
+                if rec.llm_status == "cache_miss" and not replay_only:
+                    rec.llm_status = "budget_skipped"
+                mark_done(rec)
+                continue
+            future = pool.submit(call_deepseek, rec, client, model, cache_dir)
+            pending[future] = rec
+        while pending:
+            reap()
+    return cleaned
+
 
 def evaluate(records: List[BuildingRecord], archived_count: int, elapsed: float) -> Dict[str, Any]:
     n = len(records)
@@ -274,24 +328,40 @@ def evaluate(records: List[BuildingRecord], archived_count: int, elapsed: float)
         return {}
     bilingual_name_ok = sum(1 for r in records if (r.english_name and r.chinese_name) or (not r.english_name and not r.chinese_name))
     bilingual_addr_ok = sum(1 for r in records if (r.english_address and r.chinese_address) or (not r.english_address and not r.chinese_address))
-    year_anomaly = sum(1 for r in records if r.year_category in {"blank", "dash", "other", "pre_1945"})
+    year_anomaly = sum(1 for r in records if r.year_category in {"blank", "dash", "other"})
     records_per_min = (n / elapsed * 60) if elapsed > 0 else 0
     routed_ratio = sum(1 for r in records if r.needs_llm) / n
     total_input_tokens = sum(r.input_tokens for r in records)
     total_output_tokens = sum(r.output_tokens for r in records)
-    llm_calls = sum(1 for r in records if r.llm_applied)
+    live = [r for r in records if r.llm_requested]
+    latencies = sorted(r.request_latency_seconds for r in live
+                       if r.request_latency_seconds is not None)
+
+    def percentile(p: float) -> Optional[float]:
+        return latencies[ceil(p * len(latencies)) - 1] if latencies else None
 
     return {
-        "name_bilingual_consistency": bilingual_name_ok / n,
-        "address_bilingual_consistency": bilingual_addr_ok / n,
+        "name_presence_agreement": bilingual_name_ok / n,
+        "address_presence_agreement": bilingual_addr_ok / n,
+        "names_both_blank": sum(not r.english_name and not r.chinese_name for r in records),
+        "addresses_both_blank": sum(not r.english_address and not r.chinese_address
+                                    for r in records),
         "year_anomaly_count": year_anomaly,
         "records_per_minute": records_per_min,
         "routed_record_ratio": routed_ratio,
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
-        "llm_calls": llm_calls,
+        "llm_calls": len(live),
+        "llm_applied_count": sum(r.llm_applied for r in records),
+        "llm_status_counts": dict(Counter(r.llm_status for r in records)),
+        "llm_cache_hits": sum(r.llm_origin == "cache_hit" for r in records),
+        "live_input_tokens": sum(r.input_tokens for r in live),
+        "live_output_tokens": sum(r.output_tokens for r in live),
+        "request_p50_seconds": percentile(0.50),
+        "request_p95_seconds": percentile(0.95),
         "total_records": n,
         "elapsed_seconds": elapsed,
+        "parsed_to_archived_ratio": n / archived_count if archived_count else None,
         "year_numeric": sum(1 for r in records if r.year_category == "numeric"),
         "year_blank": sum(1 for r in records if r.year_category == "blank"),
         "year_dash": sum(1 for r in records if r.year_category == "dash"),
@@ -306,11 +376,11 @@ def evaluate(records: List[BuildingRecord], archived_count: int, elapsed: float)
 
 def print_evaluation(metrics: Dict[str, Any]) -> None:
     print("\n" + "="*70, file=sys.stderr)
-    print("EVALUATION REPORT (Hybrid Selective Routing)", file=sys.stderr)
+    print("CLEANING RUN SUMMARY", file=sys.stderr)
     print("="*70, file=sys.stderr)
     print(f"Total records                 : {metrics.get('total_records', 0):,}", file=sys.stderr)
-    print(f"Name bilingual consistency    : {metrics.get('name_bilingual_consistency', 0):.4f}", file=sys.stderr)
-    print(f"Address bilingual consistency : {metrics.get('address_bilingual_consistency', 0):.4f}", file=sys.stderr)
+    print(f"Name presence agreement       : {metrics.get('name_presence_agreement', 0):.4f}", file=sys.stderr)
+    print(f"Address presence agreement    : {metrics.get('address_presence_agreement', 0):.4f}", file=sys.stderr)
     print(f"Year anomalies                : {metrics.get('year_anomaly_count', 0):,}", file=sys.stderr)
     print(f"Routed record ratio           : {metrics.get('routed_record_ratio', 0):.4f}", file=sys.stderr)
     print(f"Actual LLM calls              : {metrics.get('llm_calls', 0):,}", file=sys.stderr)
@@ -325,7 +395,7 @@ def plot_summary(records: List[BuildingRecord], metrics: Dict[str, Any], output_
         return
     n = len(records)
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Hybrid Cleaning Summary (Selective LLM)", fontsize=14, fontweight="bold")
+    fig.suptitle("Building Record Cleaning Summary", fontsize=14, fontweight="bold")
 
     year_labels = ["numeric", "blank", "dash", "pre_1945", "other"]
     year_counts = [
@@ -353,11 +423,12 @@ def plot_summary(records: List[BuildingRecord], metrics: Dict[str, Any], output_
     axes[1, 0].set_title("Confidence Score Distribution")
     axes[1, 0].set_xlabel("Confidence")
 
-    needs = sum(1 for r in records if r.needs_llm)
     llm_done = sum(1 for r in records if r.llm_applied)
+    flagged_not_applied = sum(r.needs_llm and not r.llm_applied for r in records)
     axes[1, 1].pie(
-        [n - needs, needs - llm_done, llm_done],
-        labels=[f"Rule-only\n({n-needs:,})", f"Flagged\n({needs-llm_done:,})", f"LLM applied\n({llm_done:,})"],
+        [n - flagged_not_applied - llm_done, flagged_not_applied, llm_done],
+        labels=[f"Rules retained\n({n-flagged_not_applied-llm_done:,})",
+                f"Flagged, rules retained\n({flagged_not_applied:,})", f"LLM applied\n({llm_done:,})"],
         autopct="%1.1f%%",
         colors=["#66BB6A", "#FFA726", "#EF5350"],
         startangle=90,
@@ -380,6 +451,8 @@ def write_csv(records: List[BuildingRecord], path: Path) -> None:
         "owners_corporation", "public_housing_type_en", "public_housing_type_zh",
         "public_housing_type_zh_simplified", "confidence", "needs_llm", "issues",
         "input_tokens", "output_tokens", "llm_applied", "llm_confidence", "unresolved", "llm_rationale",
+        "llm_status", "llm_origin", "llm_requested", "request_latency_seconds", "llm_error",
+        "raw", "rule_values", "llm_proposal",
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -389,12 +462,15 @@ def write_csv(records: List[BuildingRecord], path: Path) -> None:
             row["issues"] = "|".join(rec.issues)
             row["year_numeric"] = rec.year_numeric or ""
             row["confidence"] = round(rec.confidence, 3)
+            for name in ("raw", "rule_values", "llm_proposal"):
+                row[name] = json.dumps(row[name], ensure_ascii=False)
             writer.writerow(row)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hybrid rule + selective DeepSeek with plots")
-    parser.add_argument("--url")
-    parser.add_argument("--file")
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--url")
+    source_group.add_argument("--file", type=Path)
     parser.add_argument("--output", "-o", required=True)
     parser.add_argument("--format", choices=["csv", "jsonl"], default="csv")
     parser.add_argument("--limit", type=int, default=0)
@@ -402,15 +478,61 @@ def main() -> None:
     parser.add_argument("--archived-count", type=int, default=12421)
     parser.add_argument("--use-llm", action="store_true", help="Enable selective DeepSeek calls")
     parser.add_argument("--model", default="deepseek-chat")
+    parser.add_argument("--indices", type=Path, help="JSON array of one-based XML record indices")
+    parser.add_argument("--metrics-json", type=Path)
+    parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--replay-only", action="store_true", help="Never call the API")
+    parser.add_argument("--route", choices=["selective", "all"], default="selective")
+    parser.add_argument("--max-llm-requests", type=int, help="Maximum live requests in this run")
+    parser.add_argument("--input-price-per-million", type=float)
+    parser.add_argument("--output-price-per-million", type=float)
+    parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="Maximum in-flight requests (default: 1)")
+    parser.add_argument("--requests-per-minute", type=float,
+                        help="Pace live requests across all workers")
+    parser.add_argument("--floor-separators", action="store_true",
+                        help="Use the development-derived rule for explicit floor sections")
     args = parser.parse_args()
 
-    if not args.url and not args.file:
-        parser.error("Either --url or --file must be provided")
+    if args.limit < 0 or args.archived_count < 1:
+        parser.error("Use a non-negative limit and a positive archived count")
+    if args.max_llm_requests is not None and args.max_llm_requests < 0:
+        parser.error("--max-llm-requests cannot be negative")
+    if args.concurrency < 1:
+        parser.error("--concurrency must be positive")
+    if args.requests_per_minute is not None and (
+        not isfinite(args.requests_per_minute) or args.requests_per_minute <= 0
+    ):
+        parser.error("--requests-per-minute must be finite and positive")
+    if args.replay_only and not (args.use_llm and args.cache_dir):
+        parser.error("--replay-only requires --use-llm and --cache-dir")
+    prices = (args.input_price_per_million, args.output_price_per_million)
+    if (prices[0] is None) != (prices[1] is None) or any(
+        p is not None and (p < 0 or not isfinite(p)) for p in prices
+    ):
+        parser.error("Provide both token prices as finite, non-negative numbers")
+    indices = None
+    if args.indices:
+        if args.limit:
+            parser.error("--indices and --limit cannot be combined")
+        try:
+            selected = json.loads(args.indices.read_text(encoding="utf-8"))
+            if (not isinstance(selected, list) or not selected
+                    or any(type(i) is not int or i <= 0 for i in selected)
+                    or len(set(selected)) != len(selected)):
+                raise ValueError("expected a nonempty array of unique positive integers")
+            indices = set(selected)
+        except (OSError, ValueError) as error:
+            parser.error(f"Invalid --indices: {error}")
+    if args.cache_dir and not args.replay_only:
+        args.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    init_converter(args.convert if args.convert != "none" else "none")
+    if not init_converter(args.convert):
+        parser.error("--convert requires OpenCC or zhconv")
 
     client = None
-    if args.use_llm:
+    if args.use_llm and not args.replay_only and args.max_llm_requests != 0:
         if not HAS_OPENAI:
             print("Error: pip install openai", file=sys.stderr)
             sys.exit(1)
@@ -418,27 +540,67 @@ def main() -> None:
         if not api_key:
             print("Error: set DEEPSEEK_API_KEY environment variable", file=sys.stderr)
             sys.exit(1)
-        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com",
+                        timeout=60.0, max_retries=0)
+        if args.requests_per_minute is not None:
+            client = PacedClient(client, args.requests_per_minute)
 
-    source = args.url or args.file
+    source = args.url or str(args.file)
+    source_hash = None
+    if args.file:
+        with args.file.open("rb") as xml_input:
+            source_hash = hashlib.file_digest(xml_input, "sha256").hexdigest()
     print(f"Streaming records from: {source}", file=sys.stderr)
     start = time.perf_counter()
 
-    cleaned: List[BuildingRecord] = []
-    for idx, raw in enumerate(stream_records(source), start=1):
-        rec = clean_record(raw, idx)
-        if args.use_llm and rec.needs_llm and client is not None:
-            call_deepseek(rec, client, args.model)
-        cleaned.append(rec)
-        if args.limit and idx >= args.limit:
-            break
-        if idx % 200 == 0:
-            print(f"  processed {idx:,} records...", file=sys.stderr)
+    last_requested_index = max(indices) if indices else None
+
+    def selected_records():
+        selected_count = 0
+        for idx, raw in enumerate(stream_records(source), start=1):
+            if indices is not None and idx not in indices:
+                continue
+            yield clean_record(raw, idx, floor_separators=args.floor_separators)
+            selected_count += 1
+            if selected_count % 200 == 0:
+                print(f"  processed {selected_count:,} records", file=sys.stderr, flush=True)
+            if (args.limit and idx >= args.limit) or idx == last_requested_index:
+                break
+
+    if args.use_llm:
+        cleaned = process_llm_records(
+            selected_records(), client, args.model, args.cache_dir,
+            concurrency=args.concurrency, max_requests=args.max_llm_requests,
+            replay_only=args.replay_only, route=args.route,
+        )
+    else:
+        cleaned = list(selected_records())
 
     elapsed = time.perf_counter() - start
     print(f"Finished: {len(cleaned):,} records", file=sys.stderr)
 
-    metrics = evaluate(cleaned, args.archived_count, elapsed)
+    if not cleaned or (indices is not None and len(cleaned) != len(indices)):
+        parser.error("XML did not contain all requested records")
+    expected = len(indices) if indices else args.limit or args.archived_count
+    metrics = evaluate(cleaned, expected, elapsed)
+    metrics.update({
+        "expected_records": expected,
+        "xml_sha256": source_hash,
+        "indices_sha256": hashlib.sha256(json.dumps(sorted(indices)).encode()).hexdigest()
+                          if indices is not None else None,
+        "mode": "replay" if args.replay_only else "hybrid" if args.use_llm else "rules",
+        "floor_separators": args.floor_separators,
+        "floor_rule_revision": FLOOR_RULE_REVISION if args.floor_separators else None,
+        "route": args.route,
+        "concurrency": args.concurrency if args.use_llm else 1,
+        "requests_per_minute": args.requests_per_minute if args.use_llm else None,
+        "model": args.model if args.use_llm else None,
+        "prompt_version": PROMPT_VERSION if args.use_llm else None,
+        "estimated_live_cost": (
+            metrics["live_input_tokens"] * prices[0] +
+            metrics["live_output_tokens"] * prices[1]
+        ) / 1_000_000 if prices[0] is not None else None,
+    })
     print_evaluation(metrics)
 
     output_path = Path(args.output)
@@ -450,7 +612,10 @@ def main() -> None:
                 f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
 
     print(f"Wrote {len(cleaned):,} records to {output_path}", file=sys.stderr)
-    plot_summary(cleaned, metrics, output_path.stem)
+    if args.metrics_json:
+        args.metrics_json.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    if not args.no_plot:
+        plot_summary(cleaned, metrics, str(output_path.with_suffix("")))
 
 if __name__ == "__main__":
     main()
